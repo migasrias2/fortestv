@@ -3,6 +3,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 type Tag = {
   id: string;
   label: string;
+  ip?: string;
+  deviceName?: string;
 };
 
 type SamsungConfig = {
@@ -32,6 +34,12 @@ type NdefReaderLike = {
 };
 
 type NdefReaderCtor = new () => NdefReaderLike;
+type ParsedTagPayload = {
+  tagId?: string;
+  ip?: string;
+  deviceName?: string;
+  label?: string;
+};
 
 declare global {
   interface Window {
@@ -62,6 +70,107 @@ const REMOTE_BUTTONS = [
 const TAGS_KEY = "nfc_tags_v3";
 const SAMSUNG_CONFIG_KEY = "samsung_config_v1";
 
+const asString = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+
+const normalizePayload = (payload: ParsedTagPayload): ParsedTagPayload => ({
+  tagId: payload.tagId?.trim() || undefined,
+  ip: payload.ip?.trim() || undefined,
+  deviceName: payload.deviceName?.trim() || undefined,
+  label: payload.label?.trim() || undefined,
+});
+
+const normalizeSamsungConfig = (config: Partial<SamsungConfig>): SamsungConfig => ({
+  ip: (config.ip ?? "").trim(),
+  deviceName: (config.deviceName ?? "NFC Remote").trim() || "NFC Remote",
+});
+
+const parseFromSearchParams = (params: URLSearchParams): ParsedTagPayload =>
+  normalizePayload({
+    tagId: params.get("tag") ?? params.get("nfc") ?? params.get("id") ?? undefined,
+    ip: params.get("ip") ?? params.get("tv") ?? params.get("host") ?? undefined,
+    deviceName: params.get("name") ?? params.get("deviceName") ?? undefined,
+    label: params.get("label") ?? params.get("room") ?? undefined,
+  });
+
+const parseUrlPayload = (raw: string): ParsedTagPayload => {
+  const input = raw.trim();
+  if (!input) {
+    return {};
+  }
+
+  try {
+    const url = new URL(input);
+    return parseFromSearchParams(url.searchParams);
+  } catch {
+    const queryIndex = input.indexOf("?");
+    if (queryIndex >= 0) {
+      return parseFromSearchParams(new URLSearchParams(input.slice(queryIndex + 1)));
+    }
+    if (input.includes("=")) {
+      return parseFromSearchParams(new URLSearchParams(input));
+    }
+    return {};
+  }
+};
+
+const parseTextPayload = (raw: string): ParsedTagPayload => {
+  const input = raw.trim();
+  if (!input) {
+    return {};
+  }
+
+  try {
+    const json = JSON.parse(input) as Record<string, unknown>;
+    return normalizePayload({
+      tagId: asString(json.tagId) || asString(json.tag) || asString(json.id) || undefined,
+      ip: asString(json.ip) || asString(json.tvIp) || asString(json.host) || undefined,
+      deviceName: asString(json.deviceName) || asString(json.name) || undefined,
+      label: asString(json.label) || asString(json.room) || undefined,
+    });
+  } catch {
+    return parseUrlPayload(input);
+  }
+};
+
+const decodeBufferSource = (data?: BufferSource) => {
+  if (!data) {
+    return "";
+  }
+  const bytes =
+    data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return new TextDecoder().decode(bytes);
+};
+
+const parseNdefPayload = (records?: NdefRecord[]): ParsedTagPayload => {
+  if (!Array.isArray(records)) {
+    return {};
+  }
+
+  let payload: ParsedTagPayload = {};
+  for (const record of records) {
+    const raw = decodeBufferSource(record?.data);
+    if (!raw) {
+      continue;
+    }
+
+    const next =
+      record.recordType === "url"
+        ? parseUrlPayload(raw)
+        : parseTextPayload(raw);
+    payload = { ...payload, ...next };
+  }
+
+  return normalizePayload(payload);
+};
+
+const resolveSamsungConfig = (payload: ParsedTagPayload | undefined, tag: Tag | undefined, current: SamsungConfig) =>
+  normalizeSamsungConfig({
+    ip: payload?.ip ?? tag?.ip ?? current.ip,
+    deviceName: payload?.deviceName ?? tag?.deviceName ?? current.deviceName,
+  });
+
 const loadTags = (): Tag[] => {
   try {
     const saved = localStorage.getItem(TAGS_KEY);
@@ -74,6 +183,8 @@ const loadTags = (): Tag[] => {
       id?: unknown;
       label?: unknown;
       cmd?: unknown;
+      ip?: unknown;
+      deviceName?: unknown;
     }>;
     return parsed
       .filter((tag) => typeof tag.id === "string")
@@ -85,6 +196,8 @@ const loadTags = (): Tag[] => {
             : typeof tag.cmd === "string"
               ? tag.cmd
               : (tag.id as string),
+        ip: asString(tag.ip) || undefined,
+        deviceName: asString(tag.deviceName) || undefined,
       }));
   } catch {
     return [];
@@ -99,15 +212,12 @@ const loadSamsungConfig = (): SamsungConfig => {
   try {
     const raw = localStorage.getItem(SAMSUNG_CONFIG_KEY);
     if (!raw) {
-      return { ip: "", deviceName: "NFC Remote" };
+      return normalizeSamsungConfig({});
     }
     const parsed = JSON.parse(raw) as Partial<SamsungConfig>;
-    return {
-      ip: parsed.ip ?? "",
-      deviceName: parsed.deviceName ?? "NFC Remote",
-    };
+    return normalizeSamsungConfig(parsed);
   } catch {
-    return { ip: "", deviceName: "NFC Remote" };
+    return normalizeSamsungConfig({});
   }
 };
 
@@ -186,10 +296,11 @@ const RemoteButton = ({ cmd, icon, onClick, flash, disabled }: RemoteButtonProps
 const Index = () => {
   const [tags, setTags] = useState<Tag[]>(loadTags);
   const [samsungConfig, setSamsungConfig] = useState<SamsungConfig>(loadSamsungConfig);
+  const [showSetup, setShowSetup] = useState(false);
   const [nfcState, setNfcState] = useState<NfcState>("idle");
   const [nfcMsg, setNfcMsg] = useState({ title: "NFC Ready", sub: "Tap scan to start" });
   const [tvState, setTvState] = useState<TvState>("disconnected");
-  const [tvStatusMsg, setTvStatusMsg] = useState("Scan a paired tag to connect");
+  const [tvStatusMsg, setTvStatusMsg] = useState("Scan a trusted tag to connect");
   const [triggered, setTriggered] = useState<(Tag & { tagId: string }) | null>(null);
   const [flashCmd, setFlashCmd] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -212,9 +323,10 @@ const Index = () => {
   }, []);
 
   const connectSamsung = useCallback(
-    (showConnectedToast = true) => {
-      const ip = samsungConfig.ip.trim();
-      const deviceName = samsungConfig.deviceName.trim() || "NFC Remote";
+    (configInput: SamsungConfig, showConnectedToast = true) => {
+      const config = normalizeSamsungConfig(configInput);
+      const ip = config.ip;
+      const deviceName = config.deviceName;
 
       if (!isValidIpOrHost(ip)) {
         setTvState("error");
@@ -222,6 +334,9 @@ const Index = () => {
         showToast("Add Samsung TV IP first");
         return;
       }
+
+      setSamsungConfig(config);
+      saveSamsungConfig(config);
 
       if (wsRef.current) {
         wsRef.current.close();
@@ -284,18 +399,55 @@ const Index = () => {
         }
       };
     },
-    [samsungConfig.deviceName, samsungConfig.ip, showToast],
+    [showToast],
   );
 
   const triggerTag = useCallback(
-    (tagId: string) => {
+    (tagId: string, payload?: ParsedTagPayload) => {
       const tag = tags.find((item) => item.id === tagId);
-      if (tag) {
-        setTriggered({ ...tag, tagId });
-        connectSamsung(false);
+      const finalConfig = resolveSamsungConfig(payload, tag, samsungConfig);
+      const label = tag?.label ?? payload?.label ?? "Samsung TV";
+      const canConnect = Boolean(finalConfig.ip);
+
+      if (tag || canConnect) {
+        setTriggered({
+          id: tagId,
+          label,
+          ip: finalConfig.ip || undefined,
+          deviceName: finalConfig.deviceName || undefined,
+          tagId,
+        });
+
+        if (canConnect) {
+          connectSamsung(finalConfig, false);
+          setTvStatusMsg(`Connecting to ${finalConfig.ip}...`);
+          setNfcMsg({ title: "Tag detected", sub: "Connecting to Samsung TV..." });
+        } else {
+          setTvState("error");
+          setTvStatusMsg("No TV IP found for this tag");
+          setNfcMsg({ title: "Tag detected", sub: "No TV IP configured" });
+          showToast("No TV IP found for this tag");
+        }
+
         setNfcState("success");
-        setNfcMsg({ title: "Tag detected", sub: `Connecting to Samsung TV...` });
-        showToast(`Tag ${tag.label} detected`, true);
+        showToast(`Tag ${label} detected`, true);
+
+        // If scan payload includes TV info, trust and persist this tag automatically.
+        if (!tag && payload?.ip) {
+          setTags((prev) => {
+            const next: Tag[] = [
+              ...prev.filter((item) => item.id !== tagId),
+              {
+                id: tagId,
+                label,
+                ip: finalConfig.ip || undefined,
+                deviceName: finalConfig.deviceName || undefined,
+              },
+            ];
+            saveTags(next);
+            return next;
+          });
+        }
 
         timeoutRefs.current.push(
           window.setTimeout(() => {
@@ -312,21 +464,20 @@ const Index = () => {
       } else {
         setPendingId(tagId);
         setTagIdInput(tagId);
-        setTagLabelInput("");
+        setTagLabelInput(payload?.label ?? "");
         setAddOpen(true);
         setNfcState("success");
         setNfcMsg({ title: "New tag", sub: "Save it as a trusted tag" });
         showToast("New tag detected");
       }
     },
-    [connectSamsung, showToast, tags],
+    [connectSamsung, samsungConfig, showToast, tags],
   );
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const tagId = params.get("tag") || params.get("nfc");
-    if (tagId) {
-      triggerTag(tagId);
+    const payload = parseFromSearchParams(new URLSearchParams(window.location.search));
+    if (payload.tagId) {
+      triggerTag(payload.tagId, payload);
     }
   }, [triggerTag]);
 
@@ -335,6 +486,10 @@ const Index = () => {
       timeoutRefs.current.forEach((timer) => window.clearTimeout(timer));
       if (wsRef.current) {
         wsRef.current.close();
+      }
+      if (nfcRef.current) {
+        nfcRef.current.onreading = null;
+        nfcRef.current.onreadingerror = null;
       }
     },
     [],
@@ -366,7 +521,12 @@ const Index = () => {
       timeoutRefs.current.push(
         window.setTimeout(() => {
           const randomTag = tags[Math.floor(Math.random() * tags.length)];
-          triggerTag(randomTag.id);
+          triggerTag(randomTag.id, {
+            tagId: randomTag.id,
+            ip: randomTag.ip,
+            deviceName: randomTag.deviceName,
+            label: randomTag.label,
+          });
         }, 900),
       );
       return;
@@ -383,23 +543,9 @@ const Index = () => {
       reader.onreading = (event) => {
         const serial = event.serialNumber;
         const records = event.message?.records;
-        let tagId = serial || `tag-${Date.now()}`;
-
-        if (Array.isArray(records)) {
-          for (const record of records) {
-            if (record?.recordType !== "url" || !record?.data) {
-              continue;
-            }
-            const url = new TextDecoder().decode(record.data);
-            const match = url.match(/[?&]tag=([^&]+)/);
-            if (match?.[1]) {
-              tagId = decodeURIComponent(match[1]);
-              break;
-            }
-          }
-        }
-
-        triggerTag(tagId);
+        const payload = parseNdefPayload(records);
+        const tagId = payload.tagId || serial || `tag-${Date.now()}`;
+        triggerTag(tagId, payload);
       };
 
       reader.onreadingerror = () => {
@@ -427,11 +573,22 @@ const Index = () => {
       return;
     }
     const label = tagLabelInput.trim() || "Samsung TV";
-    const next: Tag[] = [...tags.filter((item) => item.id !== id), { id, label }];
+    const config = normalizeSamsungConfig(samsungConfig);
+    const next: Tag[] = [
+      ...tags.filter((item) => item.id !== id),
+      {
+        id,
+        label,
+        ip: config.ip || undefined,
+        deviceName: config.deviceName || undefined,
+      },
+    ];
     setTags(next);
     saveTags(next);
     setAddOpen(false);
     setPendingId(null);
+    setTagIdInput("");
+    setTagLabelInput("");
     showToast(`✓ Saved tag ${label}`, true);
   };
 
@@ -445,7 +602,10 @@ const Index = () => {
   const sendCmd = (cmd: string, icon: string, key: string) => {
     const socket = wsRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      showToast("Scan a paired tag to connect first");
+      if (samsungConfig.ip && tvState !== "connecting") {
+        connectSamsung(samsungConfig, false);
+      }
+      showToast("Not connected yet. Scan tag or wait...");
       return;
     }
 
@@ -472,6 +632,13 @@ const Index = () => {
   const nfcIcon =
     nfcState === "scanning" ? "📡" : nfcState === "success" ? "✓" : nfcState === "error" ? "✕" : "◉";
   const canSendCommands = tvState === "connected";
+  const updateSamsungConfig = (updates: Partial<SamsungConfig>) => {
+    setSamsungConfig((prev) => {
+      const next = normalizeSamsungConfig({ ...prev, ...updates });
+      saveSamsungConfig(next);
+      return next;
+    });
+  };
 
   return (
     <main className="min-h-screen bg-background px-4 py-6 text-foreground">
@@ -481,9 +648,18 @@ const Index = () => {
             <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground">Smart TV</p>
             <h1 className="text-2xl font-semibold">Samsung NFC Remote</h1>
           </div>
-          <span className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
-            {nfcState}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
+              {nfcState}
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowSetup((prev) => !prev)}
+              className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground hover:bg-secondary"
+            >
+              {showSetup ? "Hide setup" : "Setup"}
+            </button>
+          </div>
         </header>
 
         <section className="rounded-2xl border border-border bg-card p-4">
@@ -530,44 +706,49 @@ const Index = () => {
             </span>
           </div>
           <p className="mb-3 text-xs text-muted-foreground">{tvStatusMsg}</p>
-          <div className="grid grid-cols-1 gap-2">
-            <input
-              value={samsungConfig.ip}
-              onChange={(event) => setSamsungConfig((prev) => ({ ...prev, ip: event.target.value }))}
-              onBlur={() => saveSamsungConfig(samsungConfig)}
-              placeholder="TV IP or hostname (ex: 192.168.1.45)"
-              className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
-            />
-            <input
-              value={samsungConfig.deviceName}
-              onChange={(event) => setSamsungConfig((prev) => ({ ...prev, deviceName: event.target.value }))}
-              onBlur={() => saveSamsungConfig(samsungConfig)}
-              placeholder="Remote name"
-              className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
-            />
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => connectSamsung(true)}
-                className="rounded-lg border border-border px-3 py-2 text-sm hover:bg-secondary"
-              >
-                Connect
-              </button>
-              <button
-                type="button"
-                onClick={disconnectSamsung}
-                className="rounded-lg border border-border px-3 py-2 text-sm hover:bg-secondary"
-              >
-                Disconnect
-              </button>
+          {!showSetup && (
+            <p className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+              Scan-only mode is enabled. Open setup only for first-time TV configuration.
+            </p>
+          )}
+          {showSetup && (
+            <div className="grid grid-cols-1 gap-2">
+              <input
+                value={samsungConfig.ip}
+                onChange={(event) => updateSamsungConfig({ ip: event.target.value })}
+                placeholder="TV IP or hostname (ex: 192.168.1.45)"
+                className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+              />
+              <input
+                value={samsungConfig.deviceName}
+                onChange={(event) => updateSamsungConfig({ deviceName: event.target.value })}
+                placeholder="Remote name"
+                className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => connectSamsung(samsungConfig, true)}
+                  className="rounded-lg border border-border px-3 py-2 text-sm hover:bg-secondary"
+                >
+                  Connect
+                </button>
+                <button
+                  type="button"
+                  onClick={disconnectSamsung}
+                  className="rounded-lg border border-border px-3 py-2 text-sm hover:bg-secondary"
+                >
+                  Disconnect
+                </button>
+              </div>
             </div>
-          </div>
+          )}
         </section>
 
         <section className="rounded-2xl border border-border bg-card p-4">
           <p className="mb-3 text-xs uppercase tracking-[0.2em] text-muted-foreground">Remote</p>
           <div className="mb-3 rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-            {canSendCommands ? "Connected. Buttons are live." : "Buttons unlock after paired tag scan + TV connect."}
+            {canSendCommands ? "Connected. Buttons are live." : "Buttons unlock right after scan + connect."}
           </div>
           <div className="grid grid-cols-4 gap-2">
             {REMOTE_BUTTONS.map((item) => (
@@ -612,6 +793,9 @@ const Index = () => {
                 <div>
                   <p className="text-sm font-medium">{tag.label}</p>
                   <p className="text-xs text-muted-foreground">{tag.id}</p>
+                  {tag.ip && (
+                    <p className="text-[11px] text-muted-foreground">TV: {tag.ip}</p>
+                  )}
                 </div>
                 <button
                   type="button"
